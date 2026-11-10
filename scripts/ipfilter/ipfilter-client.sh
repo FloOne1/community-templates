@@ -41,6 +41,7 @@ fi
 source "$IPF_LIB"
 
 # --- Paramètres (seuls les réglages sans impact sur la sécurité sont modifiables) ---
+# shellcheck disable=SC2034  # utilisé par log() de la bibliothèque
 LOG_PATH="/var/log/ipfilter-client/client.log"  # Journal des actions du client
 MAX_RETRIES=3                                   # Tentatives pour obtenir le verrou d'écriture
 RETRY_DELAY=2                                   # Délai en secondes entre deux tentatives
@@ -233,7 +234,7 @@ run_with_retry() {
 
 # Contrôle une demande d'ajout avant écriture (le service root refera exactement les mêmes contrôles).
 validate_add() {
-    local addr="$1" ports="$2" reason type my_ip ip p
+    local addr="$1" ports="$2" reason type my_ip ip
     if ! reason=$(check_entry_policy "$LIST" "$addr" "$ports"); then
         log "ERROR" "Refusé : '$addr' : $reason."
         exit 4
@@ -255,7 +256,7 @@ validate_add() {
             log "WARNING" "Le domaine '$addr' ne se résout pas actuellement : il sera sans effet tant qu'il ne résoudra pas."
         fi
         for ip in $resolved; do
-            if [[ "$LIST" == "black" ]] && p=$(is_protected "$ip"); then
+            if [[ "$LIST" == "black" ]] && is_protected "$ip" >/dev/null; then
                 log "ERROR" "Refusé : '$addr' pointe vers une adresse protégée par l'administrateur ($ip)."
                 exit 4
             fi
