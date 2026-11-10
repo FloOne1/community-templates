@@ -53,13 +53,23 @@ cd scripts/ipfilter
 sudo ./install-ipfilter-access.sh --ssh-key /chemin/cle_du_client.pub
 ```
 
+Pour des essais rapides sans clé SSH, `--password` définit un mot de passe (saisi au clavier,
+8 caractères minimum) et autorise la connexion SSH par mot de passe **pour ce compte uniquement** ;
+`--no-password` le bloque à nouveau (clé uniquement). Sans l'une de ces options, une relance conserve
+l'état actuel ; un nouveau compte est créé avec le mot de passe bloqué.
+
+```bash
+sudo ./install-ipfilter-access.sh --password          # essais : connexion par mot de passe
+sudo -u clientweb ipfilter list                       # ou test local, sans SSH
+```
+
 Options utiles : `--user <compte>` (défaut `clientweb`), `--allowed-ports 22,80,443`,
 `--admin-ip <ip>` (répétable, adresses jamais blocables ; l'IP de votre session SSH est ajoutée
 automatiquement), `--refresh 15min`, `--uninstall [--purge]`. Le script est relançable pour mettre
 à jour une installation (les listes et la politique existantes sont conservées).
 
 L'installeur :
-- crée le groupe `ipfilter` et le compte `clientweb` (mot de passe verrouillé : connexion par clé uniquement) ;
+- crée le groupe `ipfilter` et le compte `clientweb` (mot de passe bloqué sauf avec `--password`) ;
 - installe les scripts (propriété root, non modifiables par le client) ;
 - crée la politique dans `/etc/ipfilter/` ;
 - ajoute `/etc/ssh/sshd_config.d/ipfilter-clientweb.conf` (ForceCommand), vérifié par `sshd -t`

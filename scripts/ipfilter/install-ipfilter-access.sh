@@ -10,7 +10,7 @@
 #                - service systemd root qui applique les listes dès qu'elles changent, au démarrage,
 #                  et toutes les 15 min (mise à jour des IP des domaines)
 #                Relançable sans risque (idempotent) pour mettre à jour une installation.
-# Usage        : sudo ./install-ipfilter-access.sh [--user clientweb] [--ssh-key cle.pub]
+# Usage        : sudo ./install-ipfilter-access.sh [--user clientweb] [--ssh-key cle.pub] [--password]
 #                       [--allowed-ports 22,80,443] [--admin-ip 198.51.100.7]
 #                sudo ./install-ipfilter-access.sh --uninstall [--purge]
 # Compatibilité: Bash 4.x+ (Debian en priorité ; Ubuntu, RedHat, AlmaLinux) avec systemd et OpenSSH
@@ -31,6 +31,8 @@ RETRY_DELAY=5                               # Délai en secondes entre deux tent
 CLIENT_USER="clientweb"                     # Compte client à créer / autoriser
 GROUP="ipfilter"                            # Groupe autorisé à modifier les listes
 SSH_KEY_FILE=""                             # Clé publique SSH du client (facultatif)
+PASSWORD_MODE=""                            # "set" = définir un mot de passe, "lock" = le bloquer, vide = inchangé
+PASSWORD_AUTH="no"                          # Connexion SSH par mot de passe autorisée pour le client (calculé)
 ALLOWED_PORTS=""                            # Ports filtrables (vide = 22,80,443 ou valeur existante)
 ADMIN_IPS=()                                # IP protégées supplémentaires (jamais blocables)
 REFRESH_INTERVAL="15min"                    # Fréquence de réapplication (IP des domaines)
@@ -82,6 +84,9 @@ Usage: $0 [options]
 
   --user <compte>          Compte client (défaut : $CLIENT_USER)
   --ssh-key <fichier.pub>  Clé publique SSH du client à autoriser
+  --password               Définit un mot de passe pour le client (demandé au clavier) et autorise
+                           la connexion SSH par mot de passe pour ce compte uniquement
+  --no-password            Bloque le mot de passe du client (connexion par clé SSH uniquement)
   --allowed-ports <liste>  Ports que le client peut filtrer (défaut : 22,80,443)
   --admin-ip <ip|réseau>   Adresse à protéger (jamais blocable) ; répétable.
                            L'IP de votre session SSH actuelle est ajoutée automatiquement.
@@ -109,6 +114,8 @@ parse_args() {
         case "$1" in
             --user)          require_value "$@"; CLIENT_USER="$2"; shift 2 ;;
             --ssh-key)       require_value "$@"; SSH_KEY_FILE="$2"; shift 2 ;;
+            --password)      PASSWORD_MODE="set"; shift ;;
+            --no-password)   PASSWORD_MODE="lock"; shift ;;
             --allowed-ports) require_value "$@"; ALLOWED_PORTS="$2"; shift 2 ;;
             --admin-ip)      require_value "$@"; ADMIN_IPS+=("$2"); shift 2 ;;
             --refresh)       require_value "$@"; REFRESH_INTERVAL="$2"; shift 2 ;;
@@ -174,7 +181,7 @@ check_prerequisites() {
     (( UNINSTALL == 1 )) && { log "INFO" "Prérequis validés."; return 0; }
 
     local cmd
-    for cmd in iptables ip6tables iptables-restore ip6tables-restore getent flock dd sha256sum useradd groupadd usermod install; do
+    for cmd in iptables ip6tables iptables-restore ip6tables-restore getent flock dd sha256sum useradd groupadd usermod install passwd chpasswd; do
         if ! command -v "$cmd" &>/dev/null; then
             log "ERROR" "Commande introuvable : $cmd (Debian : apt install iptables coreutils passwd)."
             return 1
@@ -249,12 +256,59 @@ setup_accounts() {
     if ! id "$CLIENT_USER" &>/dev/null; then
         # Shell bash nécessaire : OpenSSH exécute la ForceCommand via le shell du compte.
         useradd --create-home --shell /bin/bash --comment "Client ipfilter (listes pare-feu)" "$CLIENT_USER"
+        # Nouveau compte : mot de passe bloqué par défaut, sauf si --password est demandé.
+        passwd -l "$CLIENT_USER" &>/dev/null || true
         log "INFO" "Compte $CLIENT_USER créé."
     fi
     usermod -aG "$GROUP" "$CLIENT_USER"
-    # Mot de passe verrouillé : pas de connexion par mot de passe, uniquement par clé.
-    passwd -l "$CLIENT_USER" &>/dev/null || true
-    log "INFO" "Compte $CLIENT_USER membre du groupe $GROUP (mot de passe verrouillé)."
+    log "INFO" "Compte $CLIENT_USER membre du groupe $GROUP."
+    setup_password || return 1
+
+    # La connexion SSH par mot de passe n'est autorisée que si le compte a un mot de passe
+    # utilisable ("P" dans passwd -S) : une relance sans option conserve donc l'état précédent.
+    if [[ "$(passwd -S "$CLIENT_USER" 2>/dev/null | awk '{print $2}')" == "P" ]]; then
+        PASSWORD_AUTH="yes"
+    else
+        PASSWORD_AUTH="no"
+    fi
+    log "INFO" "Connexion SSH par mot de passe pour $CLIENT_USER : $PASSWORD_AUTH."
+    return 0
+}
+
+# Définit (saisie masquée, jamais en argument : il apparaîtrait dans l'historique et "ps")
+# ou bloque le mot de passe du client selon --password / --no-password.
+setup_password() {
+    local pw1 pw2
+    case "$PASSWORD_MODE" in
+        set)
+            # Lecture depuis le terminal si disponible, sinon depuis l'entrée standard (scripts).
+            if [[ -t 0 ]]; then
+                read -rs -p "Mot de passe pour $CLIENT_USER : " pw1; echo
+                read -rs -p "Confirmation : " pw2; echo
+            else
+                IFS= read -r pw1 || true; pw2="$pw1"
+            fi
+            if [[ "$pw1" != "$pw2" ]]; then
+                log "ERROR" "Les deux mots de passe ne correspondent pas."
+                return 1
+            fi
+            # 8 caractères minimum : le compte est exposé en SSH aux tentatives en masse.
+            if (( ${#pw1} < 8 )); then
+                log "ERROR" "Mot de passe trop court (8 caractères minimum)."
+                return 1
+            fi
+            if ! printf '%s:%s\n' "$CLIENT_USER" "$pw1" | chpasswd; then
+                log "ERROR" "Impossible de définir le mot de passe de $CLIENT_USER."
+                return 1
+            fi
+            passwd -u "$CLIENT_USER" &>/dev/null || true
+            log "INFO" "Mot de passe défini pour $CLIENT_USER."
+            ;;
+        lock)
+            passwd -l "$CLIENT_USER" &>/dev/null || true
+            log "INFO" "Mot de passe de $CLIENT_USER bloqué (clé SSH uniquement)."
+            ;;
+    esac
     return 0
 }
 
@@ -402,8 +456,8 @@ Match User $CLIENT_USER
     X11Forwarding no
     PermitTunnel no
     PermitUserRC no
-    PasswordAuthentication no
-    KbdInteractiveAuthentication no
+    PasswordAuthentication $PASSWORD_AUTH
+    KbdInteractiveAuthentication $PASSWORD_AUTH
 # Ferme le bloc Match pour ne pas affecter les directives lues ensuite dans sshd_config.
 Match all
 EOF
@@ -571,7 +625,10 @@ main() {
     fi
 
     # Étapes idempotentes : relancer le script met simplement l'installation à jour.
-    setup_accounts
+    if ! setup_accounts; then
+        log "ERROR" "Préparation du compte $CLIENT_USER impossible : installation interrompue."
+        exit 3
+    fi
     install_files
     setup_directories
     write_configuration
@@ -590,8 +647,8 @@ main() {
     fi
 
     log "INFO" "Installation terminée. Le compte $CLIENT_USER peut se connecter en SSH et utiliser 'ipfilter'."
-    [[ -z "$SSH_KEY_FILE" && ! -s "$(getent passwd "$CLIENT_USER" | cut -d: -f6)/.ssh/authorized_keys" ]] \
-        && log "WARNING" "Aucune clé SSH installée pour $CLIENT_USER : relancez avec --ssh-key <cle.pub>."
+    [[ "$PASSWORD_AUTH" == "no" && ! -s "$(getent passwd "$CLIENT_USER" | cut -d: -f6)/.ssh/authorized_keys" ]] \
+        && log "WARNING" "Ni clé SSH ni mot de passe pour $CLIENT_USER : relancez avec --ssh-key <cle.pub> ou --password."
     exit 0
 }
 
